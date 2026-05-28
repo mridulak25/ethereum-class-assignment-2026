@@ -13,25 +13,27 @@ import { TickMath } from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import { LiquidityAmounts } from "@uniswap/v4-periphery/src/libraries/LiquidityAmounts.sol";
 import { Actions } from "@uniswap/v4-periphery/src/libraries/Actions.sol";
 import { IPositionManager } from "@uniswap/v4-periphery/src/interfaces/IPositionManager.sol";
+import { Permit2Forwarder } from "@uniswap/v4-periphery/src/base/Permit2Forwarder.sol";
 
-contract RewardTokensManager is Ownable { // Main contract for managing reward tokens, responsible for creating the Uniswap V4 pool and handling reward distribution
-    using PoolIdLibrary for PoolKey; // Library for working with PoolKey and PoolId types
+contract RewardTokensManager is Ownable {
+    using PoolIdLibrary for PoolKey;
+    using StateLibrary for IPoolManager;
 
-    uint24 public constant FEE_TIER = 3000; // Fee tier for the Uniswap V4 pool (0.3% fee)
-    int24 public constant TICK_SPACING = 60; // Tick spacing for the pool, paired with the 0.3% fee tier
+    uint24 public constant FEE_TIER = 3000;
+    int24 public constant TICK_SPACING = 60;
     address public constant HOOKS = address(0);
 
-    IPoolManager public immutable poolManager; // Interface for interacting with the Uniswap V4 pool manager, used to create and manage liquidity pools
-    IPositionManager public immutable positionManager; // Interface for managing liquidity positions in the Uniswap V4 pool, used to add/remove liquidity and collect fees
-    address public immutable pnpToken; // Address of the PNPToken, one of the two reward tokens that will be traded in the Uniswap V4 pool
-    address public immutable fnbToken; // Addresses of the two reward tokens (PNPToken and FNBToken) that will be traded in the Uniswap V4 pool
+    IPoolManager public immutable poolManager;
+    IPositionManager public immutable positionManager;
+    address public immutable pnpToken;
+    address public immutable fnbToken;
 
     address public currency0;
     address public currency1;
 
-    mapping(bytes32 => bool) public createdPools; // Mapping to track which pools have been created by this contract, using the pool ID as the key and a boolean to indicate if it has been created
+    mapping(bytes32 => bool) public createdPools;
 
-    event PoolCreated( 
+    event PoolCreated(
         bytes32 poolId,
         address currency0,
         address currency1,
@@ -41,18 +43,31 @@ contract RewardTokensManager is Ownable { // Main contract for managing reward t
         uint160 sqrtPriceX96
     );
 
-    constructor( // Constructor for the RewardTokensManager contract, initializes the pool manager, position manager, and token addresses, and determines the canonical order of the two tokens based on their addresses
+    event LiquidityMinted(
+        bytes32 poolId,
+        uint256 positionId,
+        address owner,
+        int24 tickLower,
+        int24 tickUpper,
+        uint128 liquidity
+    );
+
+    error InvalidAmount();
+    error InvalidTickRange();
+    error PoolNotCreated();
+    error TickRangeDoesNotCoverAssignmentPrice();
+
+    constructor(
         address _poolManager,
         address _positionManager,
         address _pnpToken,
         address _fnbToken
-    ) Ownable(msg.sender) { // Initialize the Ownable contract with the deployer as the owner
+    ) Ownable(msg.sender) { 
         poolManager = IPoolManager(_poolManager);
         positionManager = IPositionManager(_positionManager);
         pnpToken = _pnpToken;
         fnbToken = _fnbToken;
 
-        // Determine the canonical order of the two tokens based on their addresses, ensuring that currency0 is always the token with the lower address and currency1 is the token with the higher address. This is important for consistency in how the Uniswap V4 pool identifies the two tokens and calculates prices.
         if (_pnpToken < _fnbToken) {
             currency0 = _pnpToken;
             currency1 = _fnbToken;
@@ -62,7 +77,7 @@ contract RewardTokensManager is Ownable { // Main contract for managing reward t
         }
     }
 
-    function _poolKey() internal view returns (PoolKey memory) { // Internal function to construct the PoolKey struct for the Uniswap V4 pool, which includes the two currencies, fee tier, tick spacing, and hooks address. This key is used to identify the pool when creating it and interacting with it through the pool manager and position manager.
+    function _poolKey() internal view returns (PoolKey memory) { // Helper function to construct the PoolKey struct based on the contract's configured currencies, fee tier, tick spacing, and hooks address. This is used for pool creation and interaction with the PoolManager.
         return PoolKey({
             currency0: Currency.wrap(currency0),
             currency1: Currency.wrap(currency1),
@@ -72,29 +87,85 @@ contract RewardTokensManager is Ownable { // Main contract for managing reward t
         });
     }
 
-    function getCanonicalCurrencies() public view returns (address, address) { // Public function to return the canonical order of the two reward token addresses, ensuring that users and external contracts can easily determine which token is currency0 and which is currency1 when interacting with the Uniswap V4 pool
+    function getCanonicalCurrencies() public view returns (address, address) { // Public function to retrieve the canonical currency addresses (currency0 and currency1) that this contract is configured to use for the Uniswap V4 pool. This can be used by external callers to know which tokens are being managed by this contract.
         return (currency0, currency1);
     }
 
-    function getPoolId() public view returns (bytes32) { // Public function to return the pool ID for the Uniswap V4 pool that this contract manages, which is derived from the PoolKey. This ID is used to identify the pool when interacting with it through the pool manager and position manager, and can be used by external contracts to query information about the pool or add/remove liquidity.
+    function getPoolId() public view returns (bytes32) {
         return PoolId.unwrap(_poolKey().toId());
     }
 
-    function getTargetTick() public pure returns (int24) {
-        
-        // price = currency1/currency0 = 1.0001^tick. Derive the tick for that ratio and align to spacing 60.
+    function getTargetTick() public pure returns (int24) {  // This function returns the target tick that the liquidity position covers.
         return 23040;
-    }
+    } // 1 FNBT is worth the same as 10 PNPT.
+     // Uniswap sorts tokens by their contract address. So currency0 is PNTB and currency1 is FNBT.
+     // price = currency1 / currency0, SO FNBT / PNPT = 0.10 / 0.01 = 10, and tick = log1.0001(price) * 2^96 = 23040.
 
     function createPool(uint160 sqrtPriceX96) external onlyOwner returns (bytes32 poolId) {
-        // Create the Uniswap V4 pool for the two reward tokens with the specified initial price (sqrtPriceX96). This function can only be called by the owner of the contract (e.g., a governance contract or admin) to ensure that the pool is created in a controlled manner. The function constructs the PoolKey, calls the pool manager to initialize the pool, and emits an event with the details of the created pool.
         PoolKey memory key = _poolKey();
         poolManager.initialize(key, sqrtPriceX96);
-
         poolId = PoolId.unwrap(key.toId());
         createdPools[poolId] = true;
+        emit PoolCreated(poolId, currency0, currency1, FEE_TIER, TICK_SPACING, HOOKS, sqrtPriceX96);
+    }
 
-        emit PoolCreated(poolId, currency0, currency1, FEE_TIER, TICK_SPACING, HOOKS, sqrtPriceX96); // Emit an event to log the creation of the new pool. 
+    function mintLiquidity( 
+        int24 tickLower,
+        int24 tickUpper,
+        uint256 amount0Desired,
+        uint256 amount1Desired
+    ) external returns (uint256 positionId, bytes32 poolId) { 
+        // 1) Validate inputs 
+        if (amount0Desired == 0 && amount1Desired == 0) revert InvalidAmount();
+        if (tickLower >= tickUpper) revert InvalidTickRange();
+        if (tickLower % TICK_SPACING != 0 || tickUpper % TICK_SPACING != 0) revert InvalidTickRange();
+
+        // 2) Ensure range covers the assignment target tick
+        int24 target = getTargetTick();
+        if (tickLower > target || tickUpper < target) revert TickRangeDoesNotCoverAssignmentPrice();
+
+        // 3) Resolve and verify the pool
+        PoolKey memory key = _poolKey();
+        poolId = PoolId.unwrap(key.toId());
+        if (!createdPools[poolId]) revert PoolNotCreated();
+
+        // 4) Compute liquidity from desired amounts at current price
+        (uint160 sqrtPriceX96, , , ) = poolManager.getSlot0(key.toId());
+        uint160 sqrtLower = TickMath.getSqrtPriceAtTick(tickLower);
+        uint160 sqrtUpper = TickMath.getSqrtPriceAtTick(tickUpper);
+        uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(
+            sqrtPriceX96, sqrtLower, sqrtUpper, amount0Desired, amount1Desired
+        );
+
+        // 5) Pull tokens from owner into this contract
+        if (amount0Desired > 0) IERC20(currency0).transferFrom(msg.sender, address(this), amount0Desired);
+        if (amount1Desired > 0) IERC20(currency1).transferFrom(msg.sender, address(this), amount1Desired);
+
+        // 6) Approve Permit2 so PositionManager can settle
+       address permit2 = address(Permit2Forwarder(address(positionManager)).permit2());
+        IERC20(currency0).approve(permit2, type(uint256).max);
+        IERC20(currency1).approve(permit2, type(uint256).max);
+
+        // 7) Build actions and execute
+        bytes memory actions = abi.encodePacked(uint8(Actions.MINT_POSITION), uint8(Actions.SETTLE_PAIR));
+        bytes[] memory params = new bytes[](2);
+        params[0] = abi.encode(
+            key, tickLower, tickUpper, liquidity, type(uint128).max, type(uint128).max, msg.sender, bytes("")
+        );
+        params[1] = abi.encode(key.currency0, key.currency1);
+
+        positionId = positionManager.nextTokenId(); // Get the next position ID before minting, so we can verify it after the mint action is executed.
+        positionManager.modifyLiquidities(abi.encode(actions, params), block.timestamp + 60);
+
+        // 8) Verify mint succeeded
+        require(positionManager.getPositionLiquidity(positionId) == liquidity, "mint failed");
+
+        // 9) Refund dust and emit
+        uint256 bal0 = IERC20(currency0).balanceOf(address(this));
+        uint256 bal1 = IERC20(currency1).balanceOf(address(this));
+        if (bal0 > 0) IERC20(currency0).transfer(msg.sender, bal0);
+        if (bal1 > 0) IERC20(currency1).transfer(msg.sender, bal1);
+
+        emit LiquidityMinted(poolId, positionId, msg.sender, tickLower, tickUpper, liquidity); // Emit an event to log the minting of liquidity. 
+    }
 }
-} 
-
